@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .errors import Conflict
 from .service import PhotonService
 
 
 class Handler(BaseHTTPRequestHandler):
     service = PhotonService()
+    # 单连接服务在请求线程间串行执行，避免并发的 SQLite 调用
+    lock = threading.Lock()
+
+    def do_GET(self):
+        with self.lock:
+            self._get()
+
+    def do_POST(self):
+        with self.lock:
+            self._post()
 
     def _json(self, status: int, body: dict) -> None:
         data = json.dumps(body, ensure_ascii=False).encode()
@@ -20,7 +32,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
+    def _get(self):
         if self.path == "/health":
             return self._json(200, {"status": "ok", "service": "photon-fab"})
         if self.path.startswith("/lots/"):
@@ -31,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": str(exc)})
         return self._json(404, {"error": "not found"})
 
-    def do_POST(self):
+    def _post(self):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
             if self.path == "/login":
@@ -44,9 +56,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, self.service.add_measurement(token, lot_id, body["wavelength_nm"], body["response"], body.get("noise", 0.0), body["instrument"]))
             if self.path.startswith("/lots/") and self.path.endswith("/analysis"):
                 return self._json(200, self.service.analyze(token, self.path.split("/")[2]))
+            if self.path.startswith("/lots/") and self.path.endswith("/approvals"):
+                lot_id = self.path.split("/")[2]
+                return self._json(201, self.service.approve(token, lot_id, body["decision"], body["reason"], body.get("idempotency_key"), body.get("analysis_id")))
+            if self.path.startswith("/lots/") and self.path.endswith("/reconsiderations"):
+                lot_id = self.path.split("/")[2]
+                return self._json(201, self.service.request_reconsideration(token, lot_id, body["analysis_id"], body["reason"], body.get("idempotency_key")))
+            if self.path.startswith("/reconsiderations/") and self.path.endswith("/resolve"):
+                reconsideration_id = int(self.path.split("/")[2])
+                return self._json(201, self.service.resolve_reconsideration(token, reconsideration_id, body["decision"], body["reason"], body.get("idempotency_key")))
             return self._json(404, {"error": "not found"})
         except PermissionError as exc:
             return self._json(403, {"error": str(exc)})
+        except Conflict as exc:
+            return self._json(409, {"error": str(exc)})
         except Exception as exc:
             return self._json(400, {"error": str(exc)})
 
